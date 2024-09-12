@@ -1,75 +1,80 @@
 import numpy as np
-from numba import jit
-from multiprocessing import Pool, shared_memory
-from tqdm import tqdm
-import time
+from numba import njit, prange, set_num_threads
 import argparse
+import time
 
-@jit(nopython=True)
-def simulate_points(num_simulations):
-    points = np.random.random((num_simulations, 2))
-    min_sum = np.sum(np.minimum(points[:, 0], points[:, 1]))
-    max_sum = np.sum(np.maximum(points[:, 0], points[:, 1]))
-    return min_sum, max_sum
+# Define a structured array dtype for our points
+point_dtype = np.dtype([('x', np.float64), ('y', np.float64)])
 
-def worker(args):
-    num_simulations, shm_name, offset = args
-    shm = shared_memory.SharedMemory(name=shm_name)
-    result = np.ndarray((2,), dtype=np.float64, buffer=shm.buf[offset:offset+16])
-    min_sum, max_sum = simulate_points(num_simulations)
-    result[0] = min_sum
-    result[1] = max_sum
-    shm.close()
-    return offset
+@njit
+def xoroshiro128p_next(state):
+    """Xoroshiro128+ random number generator."""
+    result = (state[0] + state[1]) & 0xFFFFFFFFFFFFFFFF
+    s1 = state[1] ^ state[0]
+    state[0] = ((state[0] << 24) | (state[0] >> 40)) ^ s1 ^ (s1 << 16)
+    state[1] = (s1 << 37) | (s1 >> 27)
+    return result
 
-def parallel_simulate(total_simulations, num_processes):
-    simulations_per_process = total_simulations // num_processes
+@njit
+def xoroshiro128p_uniform_float64(state):
+    """Generate a uniform float64 in [0, 1) using Xoroshiro128+."""
+    return (xoroshiro128p_next(state) >> 11) * (1.0 / 9007199254740992.0)
 
-    shm = shared_memory.SharedMemory(create=True, size=num_processes * 16)
-    result_array = np.ndarray((num_processes, 2), dtype=np.float64, buffer=shm.buf)
+@njit(parallel=True)
+def simulate_points(num_simulations, chunk_size):
+    total_min_sum = 0.0
+    total_max_sum = 0.0
 
-    pool = Pool(processes=num_processes)
+    for _ in prange(num_simulations // chunk_size):
+        local_state = np.array([np.random.randint(1, 2**32), np.random.randint(1, 2**32)], dtype=np.uint64)
+        points = np.empty(chunk_size, dtype=point_dtype)
 
+        for i in range(chunk_size):
+            points[i]['x'] = xoroshiro128p_uniform_float64(local_state)
+            points[i]['y'] = xoroshiro128p_uniform_float64(local_state)
+
+        min_vals = np.minimum(points['x'], points['y'])
+        max_vals = np.maximum(points['x'], points['y'])
+
+        total_min_sum += np.sum(min_vals)
+        total_max_sum += np.sum(max_vals)
+
+    return total_min_sum, total_max_sum
+
+def run_simulation(total_simulations, num_threads, chunk_size):
+    set_num_threads(num_threads)
     start_time = time.time()
 
-    with tqdm(total=num_processes, desc="Simulating", unit="batch") as pbar:
-        results = pool.imap_unordered(worker,
-                                      [(simulations_per_process, shm.name, i*16) for i in range(num_processes)])
-
-        for _ in results:
-            pbar.update()
-
-    pool.close()
-    pool.join()
-
-    total_min_sum = np.sum(result_array[:, 0])
-    total_max_sum = np.sum(result_array[:, 1])
-
-    shm.close()
-    shm.unlink()
+    total_min_sum, total_max_sum = simulate_points(total_simulations, chunk_size)
 
     expected_min = total_min_sum / total_simulations
     expected_max = total_max_sum / total_simulations
 
-    return expected_min, expected_max, time.time() - start_time
+    elapsed_time = time.time() - start_time
+
+    return expected_min, expected_max, elapsed_time
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run parallel simulations")
     parser.add_argument("-s", "--simulations", type=int, default=100_000_000,
                         help="Number of simulations to run (default: 100,000,000)")
-    parser.add_argument("-p", "--processes", type=int, default=1,
-                        help="Number of processes to use (default: 1)")
+    parser.add_argument("-t", "--threads", type=int, default=1,
+                        help="Number of threads to use (default: 1)")
+    parser.add_argument("-c", "--chunk-size", type=int, default=1000,
+                        help="Chunk size for batched processing (default: 1000)")
     args = parser.parse_args()
 
     total_simulations = args.simulations
-    num_processes = args.processes
+    num_threads = args.threads
+    chunk_size = args.chunk_size
 
-    print(f"Running {total_simulations:,} simulations using {num_processes} processes...")
-    expected_min, expected_max, elapsed_time = parallel_simulate(total_simulations, num_processes)
+    print(f"Running {total_simulations:,} simulations using {num_threads} threads...")
+    print(f"Chunk size: {chunk_size}")
+    expected_min, expected_max, elapsed_time = run_simulation(total_simulations, num_threads, chunk_size)
 
     print(f"\nSimulation completed in {elapsed_time:.2f} seconds")
     print(f"Number of simulations: {total_simulations:,}")
-    print(f"Number of processes: {num_processes}")
+    print(f"Number of threads: {num_threads}")
     print(f"Expected value of minimum point: {expected_min:.6f}")
     print(f"Expected value of maximum point: {expected_max:.6f}")
 
